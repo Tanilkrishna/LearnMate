@@ -312,8 +312,8 @@ class LearnMateAPITester:
         return True
 
 def main():
-    print("🚀 Starting LearnMate API Tests")
-    print("=" * 50)
+    print("🚀 Starting LearnMate Comprehensive API Tests")
+    print("=" * 60)
     
     # Setup
     tester = LearnMateAPITester()
@@ -337,16 +337,31 @@ def main():
     tester.test_summarize_without_auth()
     tester.test_quiz_save_without_auth()
     tester.test_update_interests_without_auth()
+    
+    # Test AI features comprehensively
+    tester.test_ai_features_comprehensive()
+    
+    # Test data validation
+    tester.test_data_validation()
+    
+    # Test API response times
+    tester.test_api_response_times()
 
     # Print results
-    print("\n" + "=" * 50)
-    print(f"📊 Test Results: {tester.tests_passed}/{tester.tests_run} passed")
+    print("\n" + "=" * 60)
+    print(f"📊 Basic API Tests: {tester.tests_passed}/{tester.tests_run} passed")
+    print(f"🤖 AI Feature Tests: {tester.ai_tests_passed}/{tester.ai_tests_run} passed")
     
-    if tester.tests_passed == tester.tests_run:
+    total_tests = tester.tests_run + tester.ai_tests_run
+    total_passed = tester.tests_passed + tester.ai_tests_passed
+    
+    print(f"🎯 Overall Results: {total_passed}/{total_tests} passed ({(total_passed/total_tests)*100:.1f}%)")
+    
+    if total_passed == total_tests:
         print("🎉 All tests passed!")
         return 0
     else:
-        print(f"⚠️  {tester.tests_run - tester.tests_passed} tests failed")
+        print(f"⚠️  {total_tests - total_passed} tests failed")
         return 1
 
 if __name__ == "__main__":
