@@ -17,7 +17,7 @@ export default function Features() {
       color: 'from-blue-400 to-blue-600'
     },
     {
-      icon: <PuzzlePiece className="h-12 w-12 text-purple-500" />,
+      icon: <Puzzle className="h-12 w-12 text-purple-500" />,
       title: 'AI-Generated Quizzes',
       description: 'Test yourself instantly with custom quizzes generated from any topic. Get immediate feedback and explanations.',
       color: 'from-purple-400 to-purple-600'
