@@ -2,7 +2,7 @@ import React, { useContext } from 'react';
 import { Link } from 'react-router-dom';
 import { AuthContext } from '../App';
 import { Button } from '@/components/ui/button';
-import { Sparkles, Brain, PuzzlePiece, TrendingUp, Zap } from 'lucide-react';
+import { Sparkles, Brain, Zap, TrendingUp, Puzzle } from 'lucide-react';
 
 export default function Features() {
   const { user } = useContext(AuthContext);
