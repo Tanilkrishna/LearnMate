@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { AuthContext } from '../App';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { Sparkles, Send, Loader2, BookOpen, Calculator, Code, Leaf, Landmark, Atom, Flask, Palette } from 'lucide-react';
+import { Sparkles, Send, Loader2, BookOpen, Calculator, Code, Leaf, Landmark, Atom, Palette, TestTube } from 'lucide-react';
 import axios from 'axios';
 import { toast } from 'sonner';
 
