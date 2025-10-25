@@ -192,25 +192,26 @@ async def process_session(request: SessionDataRequest, response: Response):
         session_dict['created_at'] = session_dict['created_at'].isoformat()
         await db.sessions.insert_one(session_dict)
             
-            # Set cookie
-            response.set_cookie(
-                key="session_token",
-                value=session_token,
-                httponly=True,
-                secure=True,
-                samesite="none",
-                path="/",
-                max_age=7 * 24 * 60 * 60
-            )
-            
-            return {
-                "user": user.model_dump(mode='json'),
-                "session_token": session_token
-            }
-            
+        # Set cookie
+        response.set_cookie(
+            key="session_token",
+            value=session_token,
+            httponly=True,
+            secure=True,
+            samesite="none",
+            path="/",
+            max_age=7 * 24 * 60 * 60
+        )
+        
+        return {
+            "user": user.model_dump(mode='json'),
+            "session_token": session_token
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.error(f"Session processing error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Session processing internal error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @api_router.get("/auth/me")
 async def get_current_user(session_token: Optional[str] = Cookie(None)):
