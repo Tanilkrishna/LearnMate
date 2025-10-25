@@ -144,14 +144,8 @@ async def process_session(request: SessionDataRequest, response: Response):
             
             if resp.status_code != 200:
                 raise HTTPException(status_code=400, detail="Invalid session ID")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Session processing error: {e}")
-        raise HTTPException(status_code=400, detail="Invalid session ID")
-    
-    try:
-        data = resp.json()
+            
+            data = resp.json()
         
         # Check if user exists
         existing_user = await db.users.find_one({"email": data['email']}, {"_id": 0})
