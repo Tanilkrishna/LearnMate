@@ -151,47 +151,46 @@ async def process_session(request: SessionDataRequest, response: Response):
         raise HTTPException(status_code=400, detail="Invalid session ID")
     
     try:
-            
-            data = resp.json()
-            
-            # Check if user exists
-            existing_user = await db.users.find_one({"email": data['email']}, {"_id": 0})
-            
-            if not existing_user:
-                # Create new user
-                user = User(
-                    email=data['email'],
-                    name=data['name'],
-                    picture=data.get('picture')
-                )
-                user_dict = user.model_dump()
-                user_dict['created_at'] = user_dict['created_at'].isoformat()
-                await db.users.insert_one(user_dict)
-                
-                # Create initial progress
-                progress = Progress(user_id=user.id)
-                progress_dict = progress.model_dump()
-                progress_dict['last_activity'] = progress_dict['last_activity'].isoformat()
-                await db.progress.insert_one(progress_dict)
-            else:
-                if isinstance(existing_user['created_at'], str):
-                    existing_user['created_at'] = datetime.fromisoformat(existing_user['created_at'])
-                user = User(**existing_user)
-            
-            # Create session
-            session_token = data['session_token']
-            expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-            
-            session = Session(
-                session_token=session_token,
-                user_id=user.id,
-                expires_at=expires_at
+        data = resp.json()
+        
+        # Check if user exists
+        existing_user = await db.users.find_one({"email": data['email']}, {"_id": 0})
+        
+        if not existing_user:
+            # Create new user
+            user = User(
+                email=data['email'],
+                name=data['name'],
+                picture=data.get('picture')
             )
+            user_dict = user.model_dump()
+            user_dict['created_at'] = user_dict['created_at'].isoformat()
+            await db.users.insert_one(user_dict)
             
-            session_dict = session.model_dump()
-            session_dict['expires_at'] = session_dict['expires_at'].isoformat()
-            session_dict['created_at'] = session_dict['created_at'].isoformat()
-            await db.sessions.insert_one(session_dict)
+            # Create initial progress
+            progress = Progress(user_id=user.id)
+            progress_dict = progress.model_dump()
+            progress_dict['last_activity'] = progress_dict['last_activity'].isoformat()
+            await db.progress.insert_one(progress_dict)
+        else:
+            if isinstance(existing_user['created_at'], str):
+                existing_user['created_at'] = datetime.fromisoformat(existing_user['created_at'])
+            user = User(**existing_user)
+        
+        # Create session
+        session_token = data['session_token']
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+        
+        session = Session(
+            session_token=session_token,
+            user_id=user.id,
+            expires_at=expires_at
+        )
+        
+        session_dict = session.model_dump()
+        session_dict['expires_at'] = session_dict['expires_at'].isoformat()
+        session_dict['created_at'] = session_dict['created_at'].isoformat()
+        await db.sessions.insert_one(session_dict)
             
             # Set cookie
             response.set_cookie(
