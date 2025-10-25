@@ -2,6 +2,7 @@ import requests
 import sys
 import json
 from datetime import datetime
+import time
 
 class LearnMateAPITester:
     def __init__(self, base_url="https://studybuddy-319.preview.emergentagent.com"):
@@ -11,6 +12,8 @@ class LearnMateAPITester:
         self.tests_run = 0
         self.tests_passed = 0
         self.session = requests.Session()
+        self.ai_tests_run = 0
+        self.ai_tests_passed = 0
 
     def run_test(self, name, method, endpoint, expected_status, data=None, cookies=None):
         """Run a single API test"""
