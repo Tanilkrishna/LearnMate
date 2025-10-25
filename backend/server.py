@@ -1,85 +1,30 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Cookie, Response, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Cookie, Response
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from supabase import create_client, Client
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field
 from typing import List, Optional
-import uuid
 from datetime import datetime, timezone, timedelta
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai import AsyncOpenAI
 import httpx
 
-ROOT_DIR = Path(__file__).parent
+ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Supabase connection
+supabase_url = os.environ.get('VITE_SUPABASE_URL')
+supabase_key = os.environ.get('VITE_SUPABASE_SUPABASE_ANON_KEY')
+supabase: Client = create_client(supabase_url, supabase_key)
 
-# Emergent LLM Key
-LLM_API_KEY = os.environ['EMERGENT_LLM_KEY']
+# OpenAI API Key
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
-
-# Models
-class User(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    email: str
-    name: str
-    picture: Optional[str] = None
-    learning_interests: List[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class Session(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    session_token: str
-    user_id: str
-    expires_at: datetime
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class ChatMessage(BaseModel):
-    role: str  # 'user' or 'assistant'
-    content: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class ChatHistory(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    topic: str
-    messages: List[ChatMessage] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class QuizQuestion(BaseModel):
-    question: str
-    options: List[str]
-    correct_answer: str
-    explanation: str
-
-class QuizResult(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    topic: str
-    score: int
-    total: int
-    questions: List[dict]
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class Progress(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    xp_points: int = 0
-    topics_learned: List[str] = Field(default_factory=list)
-    learning_streak: int = 0
-    last_activity: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 # Request/Response Models
 class SessionDataRequest(BaseModel):
@@ -107,29 +52,32 @@ class UpdateInterestsRequest(BaseModel):
     interests: List[str]
 
 # Helper Functions
-async def get_user_from_token(session_token: Optional[str]) -> Optional[User]:
+async def get_user_from_token(session_token: Optional[str]) -> Optional[dict]:
     if not session_token:
         return None
-    
-    session = await db.sessions.find_one({"session_token": session_token})
-    if not session:
+
+    try:
+        # Get session
+        session_response = supabase.table('sessions').select('*').eq('session_token', session_token).maybeSingle().execute()
+
+        if not session_response.data:
+            return None
+
+        session = session_response.data
+
+        # Check if session expired
+        expires_at = datetime.fromisoformat(session['expires_at'].replace('Z', '+00:00'))
+        if expires_at < datetime.now(timezone.utc):
+            supabase.table('sessions').delete().eq('session_token', session_token).execute()
+            return None
+
+        # Get user
+        user_response = supabase.table('users').select('*').eq('id', session['user_id']).maybeSingle().execute()
+
+        return user_response.data
+    except Exception as e:
+        logging.error(f"Error getting user from token: {e}")
         return None
-    
-    # Check if session expired
-    expires_at = datetime.fromisoformat(session['expires_at']) if isinstance(session['expires_at'], str) else session['expires_at']
-    if expires_at < datetime.now(timezone.utc):
-        await db.sessions.delete_one({"session_token": session_token})
-        return None
-    
-    user_doc = await db.users.find_one({"id": session['user_id']}, {"_id": 0})
-    if not user_doc:
-        return None
-    
-    # Convert datetime strings back to datetime objects
-    if isinstance(user_doc.get('created_at'), str):
-        user_doc['created_at'] = datetime.fromisoformat(user_doc['created_at'])
-    
-    return User(**user_doc)
 
 # Auth Endpoints
 @api_router.post("/auth/session")
@@ -141,51 +89,50 @@ async def process_session(request: SessionDataRequest, response: Response):
                 headers={"X-Session-ID": request.session_id},
                 timeout=10.0
             )
-            
+
             if resp.status_code != 200:
                 raise HTTPException(status_code=400, detail="Invalid session ID")
-            
+
             data = resp.json()
-        
+
         # Check if user exists
-        existing_user = await db.users.find_one({"email": data['email']}, {"_id": 0})
-        
-        if not existing_user:
+        existing_user_response = supabase.table('users').select('*').eq('email', data['email']).maybeSingle().execute()
+
+        if not existing_user_response.data:
             # Create new user
-            user = User(
-                email=data['email'],
-                name=data['name'],
-                picture=data.get('picture')
-            )
-            user_dict = user.model_dump()
-            user_dict['created_at'] = user_dict['created_at'].isoformat()
-            await db.users.insert_one(user_dict)
-            
+            user_data = {
+                'email': data['email'],
+                'name': data['name'],
+                'picture': data.get('picture'),
+                'learning_interests': []
+            }
+            user_response = supabase.table('users').insert(user_data).execute()
+            user = user_response.data[0]
+
             # Create initial progress
-            progress = Progress(user_id=user.id)
-            progress_dict = progress.model_dump()
-            progress_dict['last_activity'] = progress_dict['last_activity'].isoformat()
-            await db.progress.insert_one(progress_dict)
+            progress_data = {
+                'user_id': user['id'],
+                'xp_points': 0,
+                'topics_learned': [],
+                'learning_streak': 0,
+                'last_activity': datetime.now(timezone.utc).isoformat()
+            }
+            supabase.table('progress').insert(progress_data).execute()
         else:
-            if isinstance(existing_user['created_at'], str):
-                existing_user['created_at'] = datetime.fromisoformat(existing_user['created_at'])
-            user = User(**existing_user)
-        
+            user = existing_user_response.data
+
         # Create session
         session_token = data['session_token']
         expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-        
-        session = Session(
-            session_token=session_token,
-            user_id=user.id,
-            expires_at=expires_at
-        )
-        
-        session_dict = session.model_dump()
-        session_dict['expires_at'] = session_dict['expires_at'].isoformat()
-        session_dict['created_at'] = session_dict['created_at'].isoformat()
-        await db.sessions.insert_one(session_dict)
-            
+
+        session_data = {
+            'session_token': session_token,
+            'user_id': user['id'],
+            'expires_at': expires_at.isoformat()
+        }
+
+        supabase.table('sessions').insert(session_data).execute()
+
         # Set cookie
         response.set_cookie(
             key="session_token",
@@ -196,9 +143,9 @@ async def process_session(request: SessionDataRequest, response: Response):
             path="/",
             max_age=7 * 24 * 60 * 60
         )
-        
+
         return {
-            "user": user.model_dump(mode='json'),
+            "user": user,
             "session_token": session_token
         }
     except HTTPException:
@@ -212,20 +159,20 @@ async def get_current_user(session_token: Optional[str] = Cookie(None)):
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return user.model_dump(mode='json')
+    return user
 
 @api_router.post("/auth/logout")
 async def logout(response: Response, session_token: Optional[str] = Cookie(None)):
     if session_token:
-        await db.sessions.delete_one({"session_token": session_token})
-    
+        supabase.table('sessions').delete().eq('session_token', session_token).execute()
+
     response.delete_cookie(
         key="session_token",
         path="/",
         secure=True,
         samesite="none"
     )
-    
+
     return {"message": "Logged out successfully"}
 
 @api_router.put("/auth/interests")
@@ -233,12 +180,9 @@ async def update_interests(request: UpdateInterestsRequest, session_token: Optio
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    await db.users.update_one(
-        {"id": user.id},
-        {"$set": {"learning_interests": request.interests}}
-    )
-    
+
+    supabase.table('users').update({'learning_interests': request.interests}).eq('id', user['id']).execute()
+
     return {"message": "Interests updated"}
 
 # AI Chat Endpoints
@@ -247,77 +191,84 @@ async def chat_with_ai(request: ChatRequest, session_token: Optional[str] = Cook
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
+
     try:
         # Get or create chat history
-        chat_id = request.chat_id or str(uuid.uuid4())
-        chat_doc = await db.chat_history.find_one({"id": chat_id}, {"_id": 0})
-        
-        if chat_doc:
-            # Convert datetime strings
-            for msg in chat_doc['messages']:
-                if isinstance(msg['timestamp'], str):
-                    msg['timestamp'] = datetime.fromisoformat(msg['timestamp'])
-            if isinstance(chat_doc['created_at'], str):
-                chat_doc['created_at'] = datetime.fromisoformat(chat_doc['created_at'])
-            chat_history = ChatHistory(**chat_doc)
+        chat_id = request.chat_id
+        if chat_id:
+            chat_response = supabase.table('chat_history').select('*').eq('id', chat_id).maybeSingle().execute()
+            chat_history = chat_response.data
         else:
-            chat_history = ChatHistory(
-                id=chat_id,
-                user_id=user.id,
-                topic=request.topic,
-                messages=[]
-            )
-        
-        # Add user message
-        user_message = ChatMessage(role="user", content=request.message)
-        chat_history.messages.append(user_message)
-        
-        # Create AI chat
-        system_message = f"You are an expert AI tutor helping users learn about {request.topic}. Provide clear, engaging explanations with examples. Keep responses concise but informative."
-        
-        chat = LlmChat(
-            api_key=LLM_API_KEY,
-            session_id=chat_id,
-            system_message=system_message
-        ).with_model("openai", "gpt-4o-mini")
-        
-        # Send message
-        ai_message = UserMessage(text=request.message)
-        response = await chat.send_message(ai_message)
-        
-        # Add AI response
-        assistant_message = ChatMessage(role="assistant", content=response)
-        chat_history.messages.append(assistant_message)
-        
-        # Save to database
-        chat_dict = chat_history.model_dump()
-        for msg in chat_dict['messages']:
-            msg['timestamp'] = msg['timestamp'].isoformat()
-        chat_dict['created_at'] = chat_dict['created_at'].isoformat()
-        
-        await db.chat_history.update_one(
-            {"id": chat_id},
-            {"$set": chat_dict},
-            upsert=True
-        )
-        
-        # Update progress
-        await db.progress.update_one(
-            {"user_id": user.id},
-            {
-                "$inc": {"xp_points": 10},
-                "$addToSet": {"topics_learned": request.topic},
-                "$set": {"last_activity": datetime.now(timezone.utc).isoformat()}
+            chat_history = None
+
+        if not chat_history:
+            # Create new chat
+            chat_data = {
+                'user_id': user['id'],
+                'topic': request.topic,
+                'messages': []
             }
+            chat_response = supabase.table('chat_history').insert(chat_data).execute()
+            chat_history = chat_response.data[0]
+            chat_id = chat_history['id']
+
+        # Add user message
+        messages = chat_history.get('messages', [])
+        user_message = {
+            'role': 'user',
+            'content': request.message,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        messages.append(user_message)
+
+        # Create AI chat
+        if not openai_client:
+            raise HTTPException(status_code=503, detail="AI service not configured")
+
+        system_message = f"You are an expert AI tutor helping users learn about {request.topic}. Provide clear, engaging explanations with examples. Keep responses concise but informative."
+
+        # Build conversation history for OpenAI
+        openai_messages = [{"role": "system", "content": system_message}]
+        for msg in messages:
+            openai_messages.append({"role": msg["role"], "content": msg["content"]})
+
+        # Send message to OpenAI
+        completion = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=openai_messages
         )
-        
+        response = completion.choices[0].message.content
+
+        # Add AI response
+        assistant_message = {
+            'role': 'assistant',
+            'content': response,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        messages.append(assistant_message)
+
+        # Save to database
+        supabase.table('chat_history').update({'messages': messages}).eq('id', chat_id).execute()
+
+        # Update progress
+        progress_response = supabase.table('progress').select('*').eq('user_id', user['id']).maybeSingle().execute()
+        if progress_response.data:
+            progress = progress_response.data
+            new_xp = progress['xp_points'] + 10
+            topics = list(set(progress.get('topics_learned', []) + [request.topic]))
+
+            supabase.table('progress').update({
+                'xp_points': new_xp,
+                'topics_learned': topics,
+                'last_activity': datetime.now(timezone.utc).isoformat()
+            }).eq('user_id', user['id']).execute()
+
         return {
             "chat_id": chat_id,
             "response": response,
-            "timestamp": assistant_message.timestamp.isoformat()
+            "timestamp": assistant_message['timestamp']
         }
-        
+
     except Exception as e:
         logging.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -327,35 +278,23 @@ async def get_chat_history(session_token: Optional[str] = Cookie(None)):
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    chats = await db.chat_history.find({"user_id": user.id}, {"_id": 0}).sort("created_at", -1).to_list(100)
-    
-    for chat in chats:
-        for msg in chat['messages']:
-            if isinstance(msg['timestamp'], str):
-                msg['timestamp'] = datetime.fromisoformat(msg['timestamp']).isoformat()
-        if isinstance(chat['created_at'], str):
-            chat['created_at'] = datetime.fromisoformat(chat['created_at']).isoformat()
-    
-    return chats
+
+    response = supabase.table('chat_history').select('*').eq('user_id', user['id']).order('created_at', desc=True).execute()
+
+    return response.data
 
 @api_router.get("/chat/{chat_id}")
 async def get_single_chat(chat_id: str, session_token: Optional[str] = Cookie(None)):
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    chat = await db.chat_history.find_one({"id": chat_id, "user_id": user.id}, {"_id": 0})
-    if not chat:
+
+    response = supabase.table('chat_history').select('*').eq('id', chat_id).eq('user_id', user['id']).maybeSingle().execute()
+
+    if not response.data:
         raise HTTPException(status_code=404, detail="Chat not found")
-    
-    for msg in chat['messages']:
-        if isinstance(msg['timestamp'], str):
-            msg['timestamp'] = datetime.fromisoformat(msg['timestamp']).isoformat()
-    if isinstance(chat['created_at'], str):
-        chat['created_at'] = datetime.fromisoformat(chat['created_at']).isoformat()
-    
-    return chat
+
+    return response.data
 
 # Quiz Generation Endpoint
 @api_router.post("/quiz/generate")
@@ -363,10 +302,13 @@ async def generate_quiz(request: QuizRequest, session_token: Optional[str] = Coo
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
+
     try:
+        if not openai_client:
+            raise HTTPException(status_code=503, detail="AI service not configured")
+
         system_message = f"""You are an expert quiz generator. Generate {request.num_questions} multiple-choice questions about {request.topic}.
-        
+
 Return ONLY a valid JSON array of objects with this exact structure:
         [
           {{
@@ -376,34 +318,33 @@ Return ONLY a valid JSON array of objects with this exact structure:
             "explanation": "Brief explanation why this is correct"
           }}
         ]
-        
+
 Make sure questions are educational, clear, and have distinct options."""
-        
-        chat = LlmChat(
-            api_key=LLM_API_KEY,
-            session_id=f"quiz_{user.id}_{request.topic}",
-            system_message=system_message
-        ).with_model("openai", "gpt-4o-mini")
-        
-        message = UserMessage(text=f"Generate {request.num_questions} quiz questions about {request.topic}")
-        response = await chat.send_message(message)
-        
+
+        completion = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": f"Generate {request.num_questions} quiz questions about {request.topic}"}
+            ]
+        )
+        response = completion.choices[0].message.content
+
         # Parse JSON response
         import json
-        # Extract JSON from response (in case it has markdown)
         response_text = response.strip()
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0]
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0]
-        
+
         questions = json.loads(response_text)
-        
+
         return {
             "topic": request.topic,
             "questions": questions
         }
-        
+
     except Exception as e:
         logging.error(f"Quiz generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -413,29 +354,28 @@ async def save_quiz_result(request: SaveQuizRequest, session_token: Optional[str
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    quiz_result = QuizResult(
-        user_id=user.id,
-        topic=request.topic,
-        score=request.score,
-        total=request.total,
-        questions=request.questions
-    )
-    
-    result_dict = quiz_result.model_dump()
-    result_dict['created_at'] = result_dict['created_at'].isoformat()
-    await db.quiz_results.insert_one(result_dict)
-    
+
+    quiz_data = {
+        'user_id': user['id'],
+        'topic': request.topic,
+        'score': request.score,
+        'total': request.total,
+        'questions': request.questions
+    }
+
+    supabase.table('quiz_results').insert(quiz_data).execute()
+
     # Update progress
     xp_earned = request.score * 20
-    await db.progress.update_one(
-        {"user_id": user.id},
-        {
-            "$inc": {"xp_points": xp_earned},
-            "$set": {"last_activity": datetime.now(timezone.utc).isoformat()}
-        }
-    )
-    
+    progress_response = supabase.table('progress').select('*').eq('user_id', user['id']).maybeSingle().execute()
+
+    if progress_response.data:
+        new_xp = progress_response.data['xp_points'] + xp_earned
+        supabase.table('progress').update({
+            'xp_points': new_xp,
+            'last_activity': datetime.now(timezone.utc).isoformat()
+        }).eq('user_id', user['id']).execute()
+
     return {"message": "Quiz result saved", "xp_earned": xp_earned}
 
 @api_router.get("/quiz/results")
@@ -443,14 +383,10 @@ async def get_quiz_results(session_token: Optional[str] = Cookie(None)):
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    results = await db.quiz_results.find({"user_id": user.id}, {"_id": 0}).sort("created_at", -1).to_list(100)
-    
-    for result in results:
-        if isinstance(result['created_at'], str):
-            result['created_at'] = datetime.fromisoformat(result['created_at']).isoformat()
-    
-    return results
+
+    response = supabase.table('quiz_results').select('*').eq('user_id', user['id']).order('created_at', desc=True).execute()
+
+    return response.data
 
 # Summarization Endpoint
 @api_router.post("/summarize")
@@ -458,30 +394,33 @@ async def summarize_content(request: SummaryRequest, session_token: Optional[str
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
+
     try:
+        if not openai_client:
+            raise HTTPException(status_code=503, detail="AI service not configured")
+
         system_message = "You are an expert at creating concise, informative summaries. Summarize the given content in under 150 words, highlighting key points and main ideas."
-        
-        chat = LlmChat(
-            api_key=LLM_API_KEY,
-            session_id=f"summary_{user.id}",
-            system_message=system_message
-        ).with_model("openai", "gpt-4o-mini")
-        
-        message = UserMessage(text=f"Summarize this content:\n\n{request.content}")
-        response = await chat.send_message(message)
-        
-        # Update progress
-        await db.progress.update_one(
-            {"user_id": user.id},
-            {
-                "$inc": {"xp_points": 5},
-                "$set": {"last_activity": datetime.now(timezone.utc).isoformat()}
-            }
+
+        completion = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": f"Summarize this content:\n\n{request.content}"}
+            ]
         )
-        
+        response = completion.choices[0].message.content
+
+        # Update progress
+        progress_response = supabase.table('progress').select('*').eq('user_id', user['id']).maybeSingle().execute()
+        if progress_response.data:
+            new_xp = progress_response.data['xp_points'] + 5
+            supabase.table('progress').update({
+                'xp_points': new_xp,
+                'last_activity': datetime.now(timezone.utc).isoformat()
+            }).eq('user_id', user['id']).execute()
+
         return {"summary": response}
-        
+
     except Exception as e:
         logging.error(f"Summarization error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -492,20 +431,22 @@ async def get_progress(session_token: Optional[str] = Cookie(None)):
     user = await get_user_from_token(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    progress_doc = await db.progress.find_one({"user_id": user.id}, {"_id": 0})
-    if not progress_doc:
+
+    response = supabase.table('progress').select('*').eq('user_id', user['id']).maybeSingle().execute()
+
+    if not response.data:
         # Create initial progress
-        progress = Progress(user_id=user.id)
-        progress_dict = progress.model_dump()
-        progress_dict['last_activity'] = progress_dict['last_activity'].isoformat()
-        await db.progress.insert_one(progress_dict)
-        return progress.model_dump(mode='json')
-    
-    if isinstance(progress_doc['last_activity'], str):
-        progress_doc['last_activity'] = datetime.fromisoformat(progress_doc['last_activity']).isoformat()
-    
-    return progress_doc
+        progress_data = {
+            'user_id': user['id'],
+            'xp_points': 0,
+            'topics_learned': [],
+            'learning_streak': 0,
+            'last_activity': datetime.now(timezone.utc).isoformat()
+        }
+        create_response = supabase.table('progress').insert(progress_data).execute()
+        return create_response.data[0]
+
+    return response.data
 
 # Topics endpoint
 @api_router.get("/topics")
@@ -528,7 +469,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -538,7 +479,3 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
