@@ -17,7 +17,7 @@ const topicIcons = {
   'book-open': BookOpen,
   landmark: Landmark,
   atom: Atom,
-  flask: Flask,
+  flask: TestTube,
   palette: Palette
 };
 
